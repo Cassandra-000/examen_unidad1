@@ -18,8 +18,11 @@ aparte el .env, requirements.txt y los .json de datos. Capas por secciones:
                 reintento, respaldo por reglas, fusión (seguridad primero) y
                 experimento con 36 correos etiquetados (exactitud, matriz, latencia)
   Sección 4  -> Clase EvaluadorRiesgosIA (matriz de riesgos éticos)
+  Sección 4B -> Asistente explicativo (RAG: primero consulta MongoDB, después el LLM,
+                con citas) + datos de demostración
   Sección 5  -> Interfaz gráfica (Streamlit): panel, control de acceso, simulador,
-                bandeja de incidentes y configuración
+                bandeja de incidentes, asistente (chat), CRUD de las 5 colecciones
+                y configuración
   Pruebas    -> unittest para las secciones 0 (validaciones), 2, 2B, 3, 3B y 4
 
 Uso:
@@ -29,6 +32,9 @@ Uso:
   python logiuncodigo.py --mongo    -> prueba la conexión y el CRUD en MongoDB
   python logiuncodigo.py --evaluar  -> experimento de clasificación (reglas vs LLM vs híbrido)
                                        opciones: --sin-llm (solo reglas)  --guardar (a MongoDB)
+  python logiuncodigo.py --preguntar "¿Por qué CAM-102 fue enviado a inspección?"
+  python logiuncodigo.py --demo-datos      -> carga datos de demostración en MongoDB
+  python logiuncodigo.py --limpiar-demo    -> borra solo los datos de demostración
 
 El motor de reglas, el clasificador por reglas y la matriz de riesgos usan solo
 la biblioteca estándar. MongoDB:  pip install "pymongo[srv]" python-dotenv
@@ -50,7 +56,7 @@ import sys                # Para leer argumentos de línea de comandos
 import time               # Medición de latencias (perf_counter)
 import unittest           # Marco de pruebas unitarias de la biblioteca estándar
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
@@ -1052,7 +1058,8 @@ def imprimir_analisis_reglas() -> None:
 
 # ----------------------- Persistencia de cada decisión (MongoDB) -----------------------
 def registrar_decision(decision: Dict[str, object], placa: Optional[str] = None,
-                       camion_id: Optional[str] = None, operador: str = "operador") -> str:
+                       camion_id: Optional[str] = None, operador: str = "operador",
+                       extra: Optional[Dict[str, object]] = None) -> str:
     """Guarda la decisión CON su explicación paso a paso en la colección 'accesos'."""
     campos = ("P", "Q", "R", "S", "H", "D", "A", "E", "resultado", "semaforo",
               "reglas_activadas", "regla_ganadora", "explicacion")
@@ -1060,6 +1067,7 @@ def registrar_decision(decision: Dict[str, object], placa: Optional[str] = None,
     doc.update({"placa": placa.strip().upper() if placa else None,
                 "camion_id": camion_id.strip().upper() if camion_id else None,
                 "operador": operador})
+    doc.update(extra or {})
     return repo_accesos.crear(doc)
 
 
@@ -1865,6 +1873,319 @@ class EvaluadorRiesgosIA:
 
 
 # =============================================================================
+# SECCIÓN 4B: ASISTENTE EXPLICATIVO (RAG SENCILLO) + DATOS DE DEMOSTRACIÓN
+# =============================================================================
+# Patrón RAG: PRIMERO se consulta MongoDB y DESPUÉS se entrega ese contexto al LLM.
+#   1) extraer_referencias: detecta CAM-xxx, placas y temas (riesgos, incidentes, accesos...).
+#   2) recuperar_contexto: consulta camiones, accesos, incidentes, riesgos y evaluaciones.
+#   3) El LLM recibe SOLO esos registros numerados [1], [2]... y debe citarlos.
+#   4) Se verifica que cite registros reales. Si no lo hace, o si Ollama no responde, se muestra
+#      un resumen directo de los registros: nunca se presenta texto inventado.
+#   5) Si no hay registros, responde «No tengo información» SIN llamar al LLM.
+
+MAX_REGISTROS_CONTEXTO = 12
+MENSAJE_SIN_INFO = ("No tengo información sobre eso en la base de datos. Prueba preguntando por un "
+                    "camión (por ejemplo CAM-102), una placa, o por incidentes, accesos o riesgos.")
+RESPUESTA_LLM_SIN_INFO = "No tengo información suficiente para responder."
+SISTEMA_RAG = ("Eres el asistente explicativo de LogiSmart. Explicas por qué el sistema tomó una decisión "
+               "usando únicamente los registros de la base de datos que se te entregan.")
+
+_TEMAS = {   # palabra clave (sin acentos) -> colección relacionada
+    "riesgo": "riesgos_eticos", "etic": "riesgos_eticos", "mitigacion": "riesgos_eticos",
+    "incidente": "incidentes", "correo": "incidentes",
+    "acceso": "accesos", "bitacora": "accesos", "inspeccion": "accesos", "semaforo": "accesos",
+    "evaluacion": "evaluaciones_llm", "latencia": "evaluaciones_llm", "llm": "evaluaciones_llm",
+    "camion": "camiones", "placa": "camiones", "empresa": "camiones",
+}
+_ALIAS_CATEGORIAS = {
+    "materiales_peligrosos": ("peligros", "derrame", "fuga", "quimic"),
+    "sobrepeso": ("sobrepeso", "exceso de peso", "sobrecarga"),
+    "acceso_no_autorizado": ("no autorizado", "intruso", "sin autorizacion"),
+    "falla_hardware": ("hardware", "camara", "lector", "rfid", "sensor"),
+    "falla_software": ("software",),
+    "somnolencia_conductor": ("somnolencia", "dormido", "fatiga", "cansancio"),
+}
+
+
+def extraer_referencias(pregunta: str) -> Dict[str, List[str]]:
+    """Detecta en la pregunta IDs de camión, placas, colecciones relacionadas y categorías."""
+    mayus, norm = pregunta.upper(), _normalizar(pregunta)
+    return {
+        "camiones": list(dict.fromkeys(re.findall(r"\bCAM-\d+\b", mayus))),
+        "placas": list(dict.fromkeys(re.findall(r"\b[A-Z0-9]{2,3}-\d{2,3}-[A-Z0-9]{1,2}\b", mayus))),
+        "colecciones": list(dict.fromkeys(c for kw, c in _TEMAS.items() if kw in norm)),
+        "categorias": [c for c, alias in _ALIAS_CATEGORIAS.items() if any(a in norm for a in alias)],
+    }
+
+
+def compactar_registro(coleccion: str, d: Dict[str, object]) -> Dict[str, object]:
+    """Deja solo los campos útiles de un documento (el modelo de 1B tiene poco contexto)."""
+    if coleccion == "camiones":
+        datos = {k: d.get(k) for k in ("placa", "camion_id", "empresa", "autorizacion", "certificacion_conductor")}
+    elif coleccion == "accesos":
+        clave = ("Causa", "Conflicto", "Ninguna", "Resultado final")
+        datos = {"fecha": str(d.get("timestamp", ""))[:16], "camion_id": d.get("camion_id"),
+                 "placa": d.get("placa"), "premisas": {k: d.get(k) for k in "PQRSHD" if k in d},
+                 "A": d.get("A"), "E": d.get("E"), "resultado": d.get("resultado"),
+                 "regla_ganadora": d.get("regla_ganadora"),
+                 "explicacion": [p for p in d.get("explicacion", []) if p.startswith(clave)]}
+    elif coleccion == "incidentes":
+        cl = d.get("clasificacion", {})
+        datos = {"fecha": str(d.get("creado", ""))[:16], "categoria": cl.get("categoria"),
+                 "prioridad": cl.get("prioridad"), "estado": d.get("estado"), "resumen": cl.get("resumen"),
+                 "correo": str(d.get("correo_original", ""))[:160], "entidades": d.get("datos_extraidos"),
+                 "requiere_revision_humana": d.get("requiere_revision_humana")}
+    elif coleccion == "riesgos_eticos":
+        datos = {k: d.get(k) for k in ("modulo", "descripcion", "categoria", "puntaje_inicial", "nivel_inicial",
+                                       "puntaje_residual", "nivel_residual", "mitigacion")}
+    else:
+        datos = {"fecha": str(d.get("timestamp", ""))[:16], "modelo": d.get("modelo"),
+                 "latencia_ms": d.get("latencia_ms"), "coincidio_reglas": d.get("coincidio_reglas"),
+                 "prompt": str(d.get("prompt", ""))[:100]}
+    return {"coleccion": coleccion, "id": d["_id"], "datos": datos}
+
+
+def recuperar_contexto(pregunta: str, limite: int = MAX_REGISTROS_CONTEXTO) -> List[Dict[str, object]]:
+    """Consulta MongoDB según lo que mencione la pregunta. Sin pistas, ni siquiera consulta la base."""
+    ref = extraer_referencias(pregunta)
+    if not any(ref.values()):
+        return []
+    registros: List[Dict[str, object]] = []
+
+    def agregar(coleccion, docs):
+        registros.extend(compactar_registro(coleccion, d) for d in docs if d)
+
+    for cid in ref["camiones"]:
+        agregar("camiones", [repo_camiones.buscar_por_camion_id(cid)])
+        agregar("accesos", repo_accesos.historial_de(camion_id=cid, limite=3))
+        agregar("incidentes", repo_incidentes.listar(
+            {"$or": [{"datos_extraidos.camion_id": cid},
+                     {"correo_original": {"$regex": re.escape(cid), "$options": "i"}}]}, limite=3))
+    for placa in ref["placas"]:
+        agregar("camiones", [repo_camiones.buscar_por_placa(placa)])
+        agregar("accesos", repo_accesos.historial_de(placa=placa, limite=3))
+    con_id = bool(ref["camiones"] or ref["placas"])
+    cols = ref["colecciones"]
+    if "incidentes" in cols or ref["categorias"]:
+        filtro = {"clasificacion.categoria": {"$in": ref["categorias"]}} if ref["categorias"] else {}
+        agregar("incidentes", repo_incidentes.listar(filtro, limite=5))
+    if "accesos" in cols and not con_id:
+        agregar("accesos", repo_accesos.listar(limite=5, orden=[("timestamp", DESCENDING)]))
+    if "camiones" in cols and not con_id:
+        agregar("camiones", repo_camiones.listar(limite=5))
+    if "riesgos_eticos" in cols:
+        agregar("riesgos_eticos", repo_riesgos.listar(limite=6, orden=[("puntaje_inicial", DESCENDING)]))
+    if "evaluaciones_llm" in cols:
+        agregar("evaluaciones_llm", repo_evaluaciones.listar(limite=5))
+
+    vistos, unicos = set(), []
+    for r in registros:
+        if (r["coleccion"], r["id"]) not in vistos:
+            vistos.add((r["coleccion"], r["id"]))
+            unicos.append(r)
+    return unicos[:limite]
+
+
+def construir_prompt_rag(pregunta: str, registros: List[Dict[str, object]],
+                         historial: Optional[List[Dict[str, str]]] = None) -> str:
+    bloque = "\n".join(f"[{i}] ({r['coleccion']}) {json.dumps(r['datos'], ensure_ascii=False, default=str)}"
+                       for i, r in enumerate(registros, 1))
+    previo = ""
+    if historial:
+        previo = ("Conversación previa (solo ayuda a entender la pregunta; NO es una fuente):\n"
+                  + "\n".join(f"- {h['rol']}: {h['texto'][:200]}" for h in historial[-4:]) + "\n\n")
+    return (f"{previo}Pregunta del operador: {pregunta}\n\nRegistros recuperados de MongoDB:\n{bloque}\n\n"
+            "Instrucciones:\n"
+            "- Responde SOLO con la información de los registros anteriores.\n"
+            "- Cita el registro de origen de cada dato con su número entre corchetes, por ejemplo [1].\n"
+            f"- Si los registros no contienen la respuesta, responde exactamente: «{RESPUESTA_LLM_SIN_INFO}»\n"
+            "- No inventes datos. Responde en español, en máximo 6 oraciones.")
+
+
+def citas_validas(texto: str, n_registros: int) -> bool:
+    """True si el texto cita al menos un registro y todos los citados existen."""
+    citas = {int(x) for x in re.findall(r"\[(\d+)\]", texto)}
+    return bool(citas) and all(1 <= c <= n_registros for c in citas)
+
+
+def respuesta_sin_llm(registros: List[Dict[str, object]]) -> str:
+    """Resumen directo de los registros (plan de respaldo, sin modelo): nada inventado."""
+    lineas = []
+    for i, r in enumerate(registros, 1):
+        d, c = r["datos"], r["coleccion"]
+        if c == "accesos":
+            txt = (f"El {d.get('fecha')} el camión {d.get('camion_id') or d.get('placa')} obtuvo "
+                   f"{d.get('resultado')} (regla ganadora: {d.get('regla_ganadora') or 'ninguna'}). "
+                   + " ".join(d.get("explicacion") or []))
+        elif c == "camiones":
+            txt = (f"Camión {d.get('camion_id')} (placa {d.get('placa')}, {d.get('empresa') or 'sin empresa'}): "
+                   f"autorización={'sí' if d.get('autorizacion') else 'no'}, "
+                   f"certificación del conductor={'sí' if d.get('certificacion_conductor') else 'no'}.")
+        elif c == "incidentes":
+            txt = (f"Incidente de {d.get('categoria')}, prioridad {d.get('prioridad')} "
+                   f"(estado {d.get('estado')}): {d.get('resumen')}")
+        elif c == "riesgos_eticos":
+            txt = (f"Riesgo en {d.get('modulo')}: {d.get('descripcion')}. Puntaje {d.get('puntaje_inicial')} "
+                   f"({d.get('nivel_inicial')}) -> residual {d.get('puntaje_residual')} "
+                   f"({d.get('nivel_residual')}). Mitigación: {d.get('mitigacion')}")
+        else:
+            txt = json.dumps(d, ensure_ascii=False, default=str)
+        lineas.append(f"[{i}] {txt}")
+    return "\n".join(lineas)
+
+
+def _chat_ollama_texto(modelo: str, mensajes: List[Dict[str, str]]) -> str:
+    """Respuesta en texto libre (el asistente no usa formato JSON)."""
+    global _CLIENTE_OLLAMA
+    if ollama is None:
+        raise RuntimeError("Falta instalar la biblioteca ollama (pip install ollama).")
+    if _CLIENTE_OLLAMA is None:
+        _CLIENTE_OLLAMA = ollama.Client(timeout=OLLAMA_TIMEOUT)
+    return _CLIENTE_OLLAMA.chat(model=modelo, messages=mensajes, options={"temperature": 0.1})["message"]["content"]
+
+
+def responder_pregunta(pregunta: str, historial: Optional[List[Dict[str, str]]] = None,
+                       modelo: Optional[str] = None, chat_fn: Optional[Callable] = None,
+                       recuperador: Optional[Callable] = None, guardar: bool = False) -> Dict[str, object]:
+    """
+    FUNCIÓN PRINCIPAL DEL ASISTENTE. Devuelve respuesta, fuentes (registro de origen), modo
+    ('llm' | 'llm_sin_info' | 'sin_llm' | 'sin_datos'), latencia_ms y error.
+    """
+    inicio = time.perf_counter()
+    modelo = modelo or OLLAMA_MODEL
+    registros = (recuperador or recuperar_contexto)(pregunta)
+    fuentes = [{"n": i, "fuente": f"{r['coleccion']}/{r['id']}", "coleccion": r["coleccion"], "datos": r["datos"]}
+               for i, r in enumerate(registros, 1)]
+
+    def resultado(texto: str, modo: str, error: str = "") -> Dict[str, object]:
+        r = {"respuesta": texto, "fuentes": fuentes, "modo": modo, "error": error, "modelo": modelo,
+             "latencia_ms": round((time.perf_counter() - inicio) * 1000, 1)}
+        if guardar and modo != "sin_datos":
+            _registrar_consulta_asistente(pregunta, r)
+        return r
+
+    if not registros:
+        return resultado(MENSAJE_SIN_INFO, "sin_datos")
+    mensajes = [{"role": "system", "content": SISTEMA_RAG},
+                {"role": "user", "content": construir_prompt_rag(pregunta, registros, historial)}]
+    try:
+        texto = (chat_fn or _chat_ollama_texto)(modelo, mensajes).strip()
+    except Exception as exc:
+        return resultado("(El modelo no está disponible: se muestra un resumen directo de los registros)\n\n"
+                         + respuesta_sin_llm(registros), "sin_llm", f"{type(exc).__name__}: {exc}")
+    if "no tengo informacion" in _normalizar(texto)[:80]:
+        return resultado(texto, "llm_sin_info")
+    if not citas_validas(texto, len(registros)):
+        return resultado("(El modelo no citó registros válidos: se muestra un resumen directo de los registros)\n\n"
+                         + respuesta_sin_llm(registros), "sin_llm", "respuesta sin citas válidas")
+    return resultado(texto, "llm")
+
+
+def _registrar_consulta_asistente(pregunta: str, r: Dict[str, object]) -> Optional[str]:
+    try:
+        return repo_evaluaciones.crear({
+            "prompt": pregunta, "respuesta": r["respuesta"], "modelo": r["modelo"],
+            "latencia_ms": r["latencia_ms"], "coincidio_reglas": None, "tipo": "asistente",
+            "modo": r["modo"], "fuentes": [f["fuente"] for f in r["fuentes"]]})
+    except (ErrorConexion, ValueError) as exc:
+        log.warning("No se pudo guardar la consulta del asistente: %s", exc)
+        return None
+
+
+def formatear_respuesta(r: Dict[str, object]) -> str:
+    texto = r["respuesta"]
+    if r["fuentes"]:
+        texto += "\n\nFuentes consultadas:\n" + "\n".join(f"  [{f['n']}] {f['fuente']}" for f in r["fuentes"])
+    return texto
+
+
+def preguntar_en_consola(pregunta: str) -> None:
+    if not pregunta.strip():
+        print('Escribe una pregunta, por ejemplo: --preguntar "¿Por qué CAM-102 fue enviado a inspección?"')
+        return
+    try:
+        r = responder_pregunta(pregunta.strip())
+    except ErrorConexion as exc:
+        print(f"✘ {exc}")
+        return
+    print(f"\nPregunta: {pregunta}\nModo: {r['modo']}  ·  {r['latencia_ms']} ms\n\n{formatear_respuesta(r)}\n")
+
+
+# ----------------------- Datos de demostración -----------------------
+_DEMO_CAMIONES = [   # (camion_id, placa, empresa, P, Q, R, S, H, D)
+    ("CAM-101", "ABC-101-A", "Transportes del Norte", 1, 0, 1, 1, 1, 0),
+    ("CAM-102", "ABC-102-B", "Logística Centro", 1, 1, 0, 1, 1, 0),
+    ("CAM-103", "ABC-103-C", "Fletes Rápidos", 1, 0, 0, 1, 1, 1),
+    ("CAM-104", "ABC-104-D", "Transportes del Norte", 1, 0, 0, 1, 1, 0),
+    ("CAM-105", "ABC-105-E", "Carga Express", 0, 0, 0, 1, 1, 0),
+    ("CAM-106", "ABC-106-F", "Logística Centro", 1, 0, 1, 1, 0, 0),
+]
+_DEMO_INCIDENTES = [   # (correo, días atrás, estado)
+    ("Urgente: fuga de químico inflamable en el camión CAM-101, andén 3. Evacuar la zona.", 0, "en_atencion"),
+    ("La báscula marca 52 toneladas para el CAM-102 y excede el límite permitido de 48 toneladas.", 1, "nuevo"),
+    ("el chofer del CAM-103 se esta quedando dormido en la fila, cabecea mucho", 2, "cerrado"),
+    ("Reporto carga con material peligroso sin hoja de seguridad. El camión CAM-106 espera en la puerta B.", 3, "nuevo"),
+    ("La cámara del andén 4 no enciende desde esta mañana.", 8, "cerrado"),
+    ("El sistema está caído y no carga la lista de citas; no podemos registrar entradas.", 9, "en_atencion"),
+    ("se metio un tipo a la caseta sur y no traia gafete, seguridad ya va para alla", 15, "nuevo"),
+]
+_DEMO_RIESGOS = [   # (módulo, descripción, categoría, prob, imp, mitigación, prob_res, imp_res)
+    ("Clasificador híbrido", "Alucinaciones del LLM: categorías, entidades o respuestas inventadas", "fiabilidad",
+     4, 4, "Validación con pydantic, descarte de entidades ausentes del correo, RAG con citas y 'no tengo información'",
+     2, 3),
+    ("Clasificador híbrido", "Sesgo en correos con ortografía informal: menor exactitud de las reglas", "sesgo",
+     4, 4, "El LLM interpreta la intención, revisión humana cuando hay discrepancia y medición formal vs informal",
+     3, 3),
+    ("Control de acceso", "Privacidad de datos del conductor (placa, certificación, somnolencia)", "privacidad",
+     4, 5, "Guardar solo datos necesarios, credenciales en .env, operador identificado en la bitácora, retención limitada",
+     2, 4),
+    ("Sistema completo", "Dependencia excesiva de la automatización por parte del operador", "responsabilidad",
+     3, 4, "requiere_revision_humana, el operador puede editar cada resultado y la decisión final es suya",
+     2, 3),
+]
+
+
+@_seguro
+def sembrar_datos_demo() -> Dict[str, int]:
+    """Carga datos de demostración marcados con demo=True (se pueden borrar con limpiar_datos_demo)."""
+    if repo_camiones.buscar_por_camion_id("CAM-102"):
+        print("Los datos de demostración ya existen (usa --limpiar-demo para borrarlos).")
+        return {}
+    crear_indices()
+    for i, (cid, placa, empresa, p, q, r, s, h, d) in enumerate(_DEMO_CAMIONES):
+        repo_camiones.crear({"placa": placa, "camion_id": cid, "empresa": empresa, "autorizacion": bool(p),
+                             "certificacion_conductor": bool(s), "demo": True})
+        dec = evaluar_decision(bool(p), bool(q), bool(r), bool(s), bool(h), bool(d))
+        registrar_decision(dec, placa, cid, "demo", {"demo": True, "timestamp": ahora() - timedelta(hours=5 * i)})
+    for correo, dias, estado in _DEMO_INCIDENTES:
+        c = clasificar_hibrido(correo, usar_llm=False)
+        fecha = ahora() - timedelta(days=dias)
+        repo_incidentes.crear({
+            "correo_original": correo, "estado": estado, "creado": fecha, "demo": True,
+            "clasificacion": {"categoria": c["categoria"], "prioridad": c["prioridad"],
+                              "resumen": c["resumen"], "fuente": c["fuente"]},
+            "datos_extraidos": c["entidades"],
+            "historial": [{"fecha": fecha, "operador": "demo", "evento": "Incidente creado (datos de demostración)"}]})
+    for modulo, desc, cat, p, i, mit, pr, ir in _DEMO_RIESGOS:
+        repo_riesgos.crear({"modulo": modulo, "descripcion": desc, "categoria": cat, "probabilidad": p,
+                            "impacto": i, "mitigacion": mit, "probabilidad_residual": pr,
+                            "impacto_residual": ir, "demo": True})
+    resumen = {"camiones": len(_DEMO_CAMIONES), "accesos": len(_DEMO_CAMIONES),
+               "incidentes": len(_DEMO_INCIDENTES), "riesgos": len(_DEMO_RIESGOS)}
+    print("✔ Datos de demostración cargados: " + ", ".join(f"{v} {k}" for k, v in resumen.items()))
+    return resumen
+
+
+@_seguro
+def limpiar_datos_demo() -> Dict[str, int]:
+    """Borra únicamente los documentos marcados con demo=True."""
+    borrados = {r.coleccion: r.col.delete_many({"demo": True}).deleted_count
+                for r in (repo_camiones, repo_accesos, repo_incidentes, repo_riesgos, repo_evaluaciones)}
+    print("✔ Datos de demostración borrados: " + ", ".join(f"{v} de {k}" for k, v in borrados.items()))
+    return borrados
+
+
+# =============================================================================
 # SECCIÓN 5: INTERFAZ GRÁFICA (STREAMLIT)
 # =============================================================================
 # Se abre con:  streamlit run logiuncodigo.py
@@ -1883,6 +2204,8 @@ ICONOS_PAGINA = {
     "Control de acceso": ":material/traffic:",
     "Simulador lógico": ":material/toggle_on:",
     "Bandeja de incidentes": ":material/inbox:",
+    "Asistente": ":material/smart_toy:",
+    "Administrar datos": ":material/database:",
     "Configuración": ":material/settings:",
 }
 
@@ -2141,9 +2464,143 @@ def pagina_config() -> None:
     st.success("Los cambios se aplican de inmediato en esta sesión.")
 
 
+PREGUNTAS_SUGERIDAS = ["¿Por qué CAM-102 fue enviado a inspección?", "¿Qué decisión se tomó con CAM-103?",
+                       "¿Qué incidentes hay registrados?", "¿Cuáles son los riesgos más altos?"]
+
+
+@_segura
+def pagina_asistente() -> None:
+    cfg = st.session_state.cfg
+    chat = st.session_state.setdefault("chat", [])
+    st.caption("Responde SOLO con datos de MongoDB y cita el registro de origen. "
+               "Si no hay datos, dice «no tengo información».")
+    cols = st.columns(len(PREGUNTAS_SUGERIDAS))
+    for col, sugerida in zip(cols, PREGUNTAS_SUGERIDAS):
+        if col.button(sugerida, key=f"sug_{sugerida}", use_container_width=True):
+            st.session_state.chat_pendiente = sugerida
+
+    for m in chat:
+        with st.chat_message(m["rol"], avatar=":material/smart_toy:" if m["rol"] == "assistant" else ":material/person:"):
+            st.markdown(m["texto"])
+            if m.get("fuentes"):
+                with st.expander(f"Fuentes consultadas ({len(m['fuentes'])})"):
+                    for f in m["fuentes"]:
+                        st.caption(f"[{f['n']}] {f['fuente']}")
+            if m.get("modo") in ("sin_llm", "sin_datos", "llm_sin_info"):
+                st.caption({"sin_llm": "Resumen directo de los registros (sin LLM)",
+                            "sin_datos": "Sin registros relacionados en MongoDB",
+                            "llm_sin_info": "El modelo indicó que no tiene información suficiente"}[m["modo"]])
+
+    entrada = st.chat_input("Pregunta sobre camiones, accesos, incidentes o riesgos...")
+    pregunta = (st.session_state.pop("chat_pendiente", None) or entrada or "").strip()
+    if entrada is not None and len(pregunta) < 3:
+        st.warning("Escribe una pregunta de al menos 3 caracteres.")
+    elif pregunta:
+        historial = [{"rol": m["rol"], "texto": m["texto"]} for m in chat]
+        with st.spinner("Consultando MongoDB y al modelo..."):
+            r = responder_pregunta(pregunta, historial, cfg["modelo"], guardar=True)
+        chat += [{"rol": "user", "texto": pregunta},
+                 {"rol": "assistant", "texto": r["respuesta"], "fuentes": r["fuentes"], "modo": r["modo"]}]
+        st.rerun()
+    if chat and st.button("Limpiar conversación", icon=":material/delete:"):
+        chat.clear()
+        st.rerun()
+
+
+# ----------------------- CRUD de las 5 colecciones -----------------------
+# Cada campo: (nombre, tipo, extra).  tipo: texto | area | bool | int (extra=(mín, máx)) | select (extra=opciones)
+CRUD_ESQUEMAS: Dict[str, Dict[str, object]] = {
+    "camiones": {"titulo": "Camiones", "repo": repo_camiones, "campos": [
+        ("placa", "texto", None), ("camion_id", "texto", None), ("empresa", "texto", None),
+        ("autorizacion", "bool", None), ("certificacion_conductor", "bool", None)]},
+    "accesos": {"titulo": "Accesos (bitácora)", "repo": repo_accesos, "campos": [
+        ("placa", "texto", None), ("camion_id", "texto", None), ("operador", "texto", None),
+        ("P", "bool", None), ("Q", "bool", None), ("R", "bool", None), ("S", "bool", None),
+        ("A", "bool", None), ("E", "bool", None)]},
+    "incidentes": {"titulo": "Incidentes", "repo": repo_incidentes, "campos": [
+        ("correo_original", "area", None), ("estado", "select", list(ESTADOS_INCIDENTE)),
+        ("requiere_revision_humana", "bool", None)]},
+    "riesgos_eticos": {"titulo": "Riesgos éticos", "repo": repo_riesgos, "campos": [
+        ("modulo", "texto", None), ("descripcion", "area", None), ("categoria", "texto", None),
+        ("mitigacion", "area", None), ("probabilidad", "int", (1, 5)), ("impacto", "int", (1, 5)),
+        ("probabilidad_residual", "int", (1, 5)), ("impacto_residual", "int", (1, 5))]},
+    "evaluaciones_llm": {"titulo": "Evaluaciones del LLM", "repo": repo_evaluaciones, "campos": [
+        ("prompt", "area", None), ("respuesta", "area", None), ("modelo", "texto", None),
+        ("latencia_ms", "int", (0, 600000)), ("coincidio_reglas", "bool", None)]},
+}
+
+
+def _valor_inicial(tipo: str, extra: object) -> object:
+    """Valor por defecto de un campo al crear un registro."""
+    return {"texto": "", "area": "", "bool": False}.get(tipo, extra[0] if tipo in ("select", "int") else "")
+
+
+def _widget_campo(tipo: str, nombre: str, valor: object, extra: object, clave: str) -> object:
+    if tipo == "bool":
+        return st.toggle(nombre, value=bool(valor), key=clave)
+    if tipo == "int":
+        minimo, maximo = extra
+        return st.number_input(nombre, min_value=minimo, max_value=maximo, step=1, key=clave,
+                               value=max(minimo, min(maximo, int(valor if valor is not None else minimo))))
+    if tipo == "select":
+        return st.selectbox(nombre, extra, index=extra.index(valor) if valor in extra else 0, key=clave)
+    if tipo == "area":
+        return st.text_area(nombre, value=str(valor or ""), key=clave)
+    return st.text_input(nombre, value=str(valor or ""), key=clave)
+
+
+@_segura
+def pagina_datos() -> None:
+    import pandas as pd
+    nombre = st.selectbox("Colección", list(CRUD_ESQUEMAS), format_func=lambda c: CRUD_ESQUEMAS[c]["titulo"])
+    esquema = CRUD_ESQUEMAS[nombre]
+    repo, campos = esquema["repo"], esquema["campos"]
+    docs = repo.listar(limite=100)
+    t_ver, t_crear, t_editar = st.tabs(["Consultar", "Crear", "Editar o eliminar"])
+
+    with t_ver:
+        if docs:
+            st.dataframe(pd.DataFrame([{"id": d["_id"], **{c: d.get(c) for c, _, _ in campos}} for d in docs]),
+                         use_container_width=True, hide_index=True)
+            st.caption(f"{len(docs)} registro(s) mostrados (máximo 100).")
+        else:
+            st.info("Esta colección aún no tiene registros.")
+
+    with t_crear:
+        with st.form(f"crear_{nombre}", clear_on_submit=True):
+            valores = {c: _widget_campo(t, c, _valor_inicial(t, e), e, f"nuevo_{nombre}_{c}") for c, t, e in campos}
+            enviar = st.form_submit_button("Crear registro", type="primary", icon=":material/add:")
+        if enviar:
+            repo.crear(valores)
+            st.toast("Registro creado.", icon=":material/check_circle:")
+            st.rerun()
+
+    with t_editar:
+        if not docs:
+            st.info("No hay registros para editar.")
+            return
+        etiquetas = {d["_id"]: " · ".join(str(d.get(c)) for c, _, _ in campos[:2]) + f"  (…{d['_id'][-5:]})"
+                     for d in docs}
+        elegido = st.selectbox("Registro", list(etiquetas), format_func=etiquetas.get, key=f"sel_{nombre}")
+        actual = next(d for d in docs if d["_id"] == elegido)
+        with st.form(f"editar_{nombre}_{elegido}"):
+            nuevos = {c: _widget_campo(t, c, actual.get(c), e, f"ed_{nombre}_{elegido}_{c}") for c, t, e in campos}
+            guardar = st.form_submit_button("Guardar cambios", type="primary", icon=":material/save:")
+        if guardar:
+            repo.actualizar(elegido, nuevos)
+            st.toast("Registro actualizado.", icon=":material/check_circle:")
+            st.rerun()
+        confirmar = st.checkbox("Confirmo que quiero eliminar este registro", key=f"conf_{nombre}_{elegido}")
+        if st.button("Eliminar registro", icon=":material/delete:", disabled=not confirmar):
+            repo.eliminar(elegido)
+            st.toast("Registro eliminado.", icon=":material/check_circle:")
+            st.rerun()
+
+
 PAGINAS: Dict[str, Callable] = {
     "Panel de control": pagina_panel, "Control de acceso": pagina_acceso,
     "Simulador lógico": pagina_simulador, "Bandeja de incidentes": pagina_incidentes,
+    "Asistente": pagina_asistente, "Administrar datos": pagina_datos,
     "Configuración": pagina_config,
 }
 
@@ -2467,6 +2924,102 @@ class TestSeccion5Interfaz(unittest.TestCase):
         self.assertEqual(set(PAGINAS), set(ICONOS_PAGINA))
 
 
+class TestSeccion4BAsistente(unittest.TestCase):
+    """Pruebas del asistente RAG SIN MongoDB ni Ollama (se simulan con recuperador y chat_fn)."""
+
+    REGISTROS = [{"coleccion": "accesos", "id": "abc123", "datos": {
+        "fecha": "2026-10-03 10:00", "camion_id": "CAM-102", "placa": "ABC-102-B", "resultado": "INSPECCION_ESPECIAL",
+        "regla_ganadora": "E", "explicacion": ["Causa de la decisión: P=V, R=F, Q=V"]}}]
+
+    def recuperador(self, pregunta):
+        return self.REGISTROS
+
+    def test_extrae_referencias(self):
+        ref = extraer_referencias("¿Por qué cam-102 y ABC-123-D fueron a inspección? ¿hay riesgos?")
+        self.assertEqual(ref["camiones"], ["CAM-102"])
+        self.assertEqual(ref["placas"], ["ABC-123-D"])
+        self.assertIn("accesos", ref["colecciones"])
+        self.assertIn("riesgos_eticos", ref["colecciones"])
+
+    def test_sin_pistas_no_consulta_la_base(self):
+        self.assertEqual(recuperar_contexto("hola, ¿cómo estás?"), [])   # si consultara, fallaría sin Mongo
+
+    def test_sin_datos_responde_no_tengo_informacion_sin_llamar_al_llm(self):
+        def prohibido(modelo, mensajes):
+            raise AssertionError("no debe llamar al LLM cuando no hay datos")
+        r = responder_pregunta("¿Qué pasó con CAM-999?", recuperador=lambda p: [], chat_fn=prohibido)
+        self.assertEqual(r["modo"], "sin_datos")
+        self.assertEqual(r["respuesta"], MENSAJE_SIN_INFO)
+        self.assertEqual(r["fuentes"], [])
+
+    def test_respuesta_con_citas_validas(self):
+        r = responder_pregunta("¿Por qué CAM-102 fue a inspección?", recuperador=self.recuperador,
+                               chat_fn=lambda m, msgs: "Fue enviado a inspección por la regla E [1].")
+        self.assertEqual(r["modo"], "llm")
+        self.assertEqual(r["fuentes"][0]["fuente"], "accesos/abc123")
+        self.assertIn("accesos/abc123", formatear_respuesta(r))
+
+    def test_respuesta_sin_citas_se_reemplaza_por_resumen_directo(self):
+        r = responder_pregunta("pregunta CAM-102", recuperador=self.recuperador,
+                               chat_fn=lambda m, msgs: "Porque el camión era sospechoso.")
+        self.assertEqual(r["modo"], "sin_llm")
+        self.assertIn("INSPECCION_ESPECIAL", r["respuesta"])
+        self.assertNotIn("sospechoso", r["respuesta"])
+
+    def test_cita_a_un_registro_inexistente_se_rechaza(self):
+        r = responder_pregunta("pregunta CAM-102", recuperador=self.recuperador,
+                               chat_fn=lambda m, msgs: "Lo dice el registro [7].")
+        self.assertEqual(r["modo"], "sin_llm")
+
+    def test_ollama_apagado_muestra_los_registros(self):
+        def caido(modelo, mensajes):
+            raise ConnectionError("sin Ollama")
+        r = responder_pregunta("pregunta CAM-102", recuperador=self.recuperador, chat_fn=caido)
+        self.assertEqual(r["modo"], "sin_llm")
+        self.assertIn("ConnectionError", r["error"])
+        self.assertIn("CAM-102", r["respuesta"])
+
+    def test_el_modelo_puede_decir_que_no_sabe(self):
+        r = responder_pregunta("pregunta CAM-102", recuperador=self.recuperador,
+                               chat_fn=lambda m, msgs: RESPUESTA_LLM_SIN_INFO)
+        self.assertEqual(r["modo"], "llm_sin_info")
+
+    def test_prompt_numera_registros_e_incluye_historial(self):
+        prompt = construir_prompt_rag("¿por qué?", self.REGISTROS, [{"rol": "user", "texto": "hola CAM-102"}])
+        self.assertIn("[1] (accesos)", prompt)
+        self.assertIn("Cita el registro de origen", prompt)
+        self.assertIn("hola CAM-102", prompt)
+
+    def test_compactar_accesos_conserva_solo_lo_util(self):
+        doc = {"_id": "x1", "P": True, "Q": False, "A": True, "E": False, "resultado": "ACCESO_ESTANDAR",
+               "explicacion": ["Premisas: ...", "Regla A ...", "Causa de la decisión: P=V", "Resultado final: X"],
+               "operador": "secreto"}
+        datos = compactar_registro("accesos", doc)["datos"]
+        self.assertEqual(len(datos["explicacion"]), 2)
+        self.assertNotIn("operador", datos)
+
+    def test_datos_demo_cuentan_la_historia_esperada(self):
+        esperado = ["INSPECCION_ESPECIAL", "INSPECCION_ESPECIAL", "BLOQUEADO_SOMNOLENCIA",
+                    "ACCESO_ESTANDAR", "DENEGADO", "REPROGRAMAR"]
+        obtenido = [evaluar_decision(*[bool(x) for x in fila[3:]])["resultado"] for fila in _DEMO_CAMIONES]
+        self.assertEqual(obtenido, esperado)
+        self.assertEqual(len(_DEMO_RIESGOS), 4)
+
+
+class TestSeccion5Crud(unittest.TestCase):
+    """Los formularios del CRUD deben producir datos que las validaciones de MongoDB aceptan."""
+
+    def test_cinco_colecciones(self):
+        self.assertEqual(set(CRUD_ESQUEMAS), {"camiones", "accesos", "incidentes", "riesgos_eticos",
+                                              "evaluaciones_llm"})
+
+    def test_formularios_coinciden_con_las_validaciones(self):
+        for nombre, esquema in CRUD_ESQUEMAS.items():
+            valores = {c: "x" if t in ("texto", "area") else _valor_inicial(t, e)
+                       for c, t, e in esquema["campos"]}
+            self.assertTrue(esquema["repo"]._preparar(valores), nombre)   # no toca MongoDB
+
+
 class TestSeccion0Mongo(unittest.TestCase):
     """Valida las reglas de la capa de datos SIN necesitar conexión a MongoDB."""
 
@@ -2668,6 +3221,12 @@ if __name__ == "__main__":
         app_streamlit()
     elif "--mongo" in sys.argv:
         probar_mongo()
+    elif "--preguntar" in sys.argv:
+        preguntar_en_consola(" ".join(sys.argv[sys.argv.index("--preguntar") + 1:]))
+    elif "--demo-datos" in sys.argv:
+        sembrar_datos_demo()
+    elif "--limpiar-demo" in sys.argv:
+        limpiar_datos_demo()
     elif "--evaluar" in sys.argv:
         ejecutar_experimento(usar_llm="--sin-llm" not in sys.argv, guardar="--guardar" in sys.argv)
     elif "--tests" in sys.argv:
